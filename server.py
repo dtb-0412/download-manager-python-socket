@@ -1,117 +1,241 @@
 import os
+import json
+# import select
 import socket
+import struct
+from typing import Optional
 
-IP = socket.gethostbyname(socket.gethostname())
-PORT = 8080
-ADDR = (IP, PORT)
-FORMAT = "utf-8"
-BUFFER_SIZE = 262144  # 256 KiB (256 * 1024)
+from constants import SERVER_HOST, SERVER_PORT, BUFFER_SIZE, ENCODE_FORMAT, DATA_DIRECTORY
 
 
-"""
-125: Start transferring
-150: File status ok, ready for transferring
-213: File status
-221: Closing connection (client quit)
-226: Closing connection, requested file action successful (file transfer only)
-230: User logged in, proceed (authentication)
-250: Requested file action okay, completed (non file-transfer only)
-501: Syntax error in parameters or arguments
-550: File unavailable (not found/no access)
-"""
+class Server:
+	def __init__(self,
+				 host: str,
+				 port: int):
+		self._host = host
+		self._port = port
 
+		self._control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self._control_socket.bind(self.address)
 
-def _check_file_exists(conn: socket.socket, msg: list[str]) -> bool:
-	try:
-		file_path = msg[1]
-	except IndexError:  # Command error, missing parameter
-		conn.send(f"501 Syntax error: Expected file path after {msg[0]} command".encode(FORMAT))
-		return False
+		self._clients = {}
 
-	if not os.path.exists(file_path):
-		conn.send("550 File not found".encode(FORMAT))
-		return False
-	return True
+		self._permitted_files = {}
+		self._load_file_permissions()
 
+	@property
+	def address(self) -> tuple[str, int]:
+		return self._host, self._port
 
-def _list(conn: socket.socket, msg: list[str]) -> None:
-	try:
-		path = msg[1]
-	except IndexError:  # Command error, missing parameter
-		conn.send("501 Syntax error: Expected directory/file path after LIST command".encode(FORMAT))
+	@staticmethod
+	def _send(client_socket: socket.socket, data: str | bytes) -> None:
+		"""
+		Send data to the client socket
+
+		:param client_socket: Socket to send
+		:param data: Data to send, encode to bytes if necessary
+		:return: None
+		"""
+		if isinstance(data, str):
+			data = data.encode(ENCODE_FORMAT)
+		
+		packed_data = struct.pack("!I", len(data)) + data
+		client_socket.sendall(packed_data)
 		return None
 
-	if not os.path.exists(path):  # Directory/file not found
-		conn.send(f"550 Directory/file not found".encode(FORMAT))
+	@staticmethod
+	def _recv(client_socket: socket.socket) -> Optional[tuple[int, str]]:
+		"""
+		Receive data from client socket
+
+		:param client_socket: Socket to receive
+		:return: Tuple of data received and its size
+		"""
+		header = Server._recv_n(client_socket, 4)
+		if not header:
+			return None
+
+		size = struct.unpack("!I", header)[0]
+		data = Server._recv_n(client_socket, size).decode(ENCODE_FORMAT)
+		return size, data
+
+	@staticmethod
+	def _recv_n(client_socket: socket.socket, size: int) -> Optional[bytes]:
+		"""
+		Receive exactly size bytes from client socket
+
+		:param client_socket: Socket to receive
+		:param size: Number of bytes to receive
+		:return: Data received
+		"""
+		data = bytearray()
+		while (current_size := len(data)) < size:
+			packet = client_socket.recv(size - current_size)
+			if not packet:
+				return None
+			data.extend(packet)
+		return data
+
+	@staticmethod
+	def _get_open_address() -> Optional[tuple[str, int]]:
+		"""
+		Get an open port from the operating system
+
+		:return: Tuple of server IP and open port
+		"""
+		try:
+			with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+				sock.bind(("", 0))
+				return sock.getsockname()
+		except OSError:
+			print(f"Service unavailable, please reconnect later")
 		return None
 
-	conn.send("150 File status ok".encode(FORMAT))
-	if os.path.isdir(path):  # Send list of files names
-		conn.send(f"{os.listdir(path)}".encode(FORMAT))
-	else:  # Send file information
-		print(f"{os.stat(path)}")
-		conn.send(f"{os.stat(path)}".encode(FORMAT))
-	conn.send("226 Directory/file information sent".encode(FORMAT))
-	return None
+	def _load_file_permissions(self) -> None:
+		"""
+		Load file permissions
 
-
-def _retr(conn: socket.socket, msg: list[str]) -> None:
-	if not _check_file_exists(conn, msg):
-		return None
-	conn.send("150 File status ok".encode(FORMAT))
-	# Transfer file data
-	with open(msg[1], "rb") as file:
-		while True:
-			data = file.read(BUFFER_SIZE)
+		:return: None
+		"""
+		with open("file_permission.json", "r") as file:
+			data = json.load(file).get("permitted_files")
 			if not data:
-				break
-			conn.send(data)
+				return None
 
-	conn.send("EOF".encode(FORMAT))
-	conn.recv(1024).decode(FORMAT)  # Important: sending "EOF" and "226" consecutively sometimes causes the messages to mess up the order
-	conn.send("226 Transfer complete".encode(FORMAT))
-	return None
-
-
-def _quit(conn: socket.socket) -> None:
-	conn.send("221 Goodbye!".encode(FORMAT))
-	conn.close()
-	return None
-
-
-def _size(conn: socket.socket, msg: list[str]) -> None:
-	if not _check_file_exists(conn, msg):
+			self._permitted_files = {file_name: os.path.getsize(os.path.join(DATA_DIRECTORY, file_name)) for file_name in set(data.keys())}
 		return None
-	conn.send(f"150 {os.path.getsize(msg[1])}".encode(FORMAT))
-	return None
 
+	def _get_file_status(self, client_socket: socket.socket, file_name: str) -> tuple[bool, Optional[str]]:
+		"""
+		Get file status, send error message if file is unavailable
 
-def main():
-	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	sock.bind((IP, PORT))
-	sock.listen()
+		:param client_socket: Client socket
+		:param file_name: File name
+		:return: Tuple of file status and file path on server
+		"""
+		# Check file permissions
+		if self._permitted_files and self._permitted_files.get(file_name) is None:
+			self._send(client_socket, f"550 File unavailable: {file_name}")
+			return False, None
+		# Check file existence
+		file_path = os.path.join(DATA_DIRECTORY, file_name)
+		if not os.path.exists(file_path):
+			self._send(client_socket, f"550 File missing: {file_name}")
+			return False, None
+		return True, file_path
 
-	conn, addr = sock.accept()
-	conn.send("220 Service ready for new user".encode(FORMAT))
+	def _list(self, client_socket: socket.socket) -> None:
+		"""
+		Send list of permitted files to client
 
-	while True:
-		msg = conn.recv(1024).decode().split()
-		match msg[0]:
+		:param client_socket: Client socket
+		:return:
+		"""
+		if not self._permitted_files:
+			self._send(client_socket, f"550 File permissions unavailable")
+			return None
+
+		self._send(client_socket, "150 File status ok")
+		self._send(client_socket, json.dumps(self._permitted_files))
+		self._send(client_socket, "226 File permissions sent")
+		return None
+
+	def _quit(self, client_socket: socket.socket) -> None:
+		"""
+		Client disconnect, close sockets
+
+		:param client_socket: Client socket
+		:return: None
+		"""
+		self._send(client_socket, "221 Goodbye!")
+		client_socket.close()
+		return None
+
+	def _retr(self, client_socket: socket.socket, file_name: str) -> None:
+		"""
+		Send requested file to client
+
+		:param client_socket: Client socket
+		:param file_name: File name
+		:return: None
+		"""
+		# Check file status
+		file_status, file_path = self._get_file_status(client_socket, file_name)
+		if not file_status:
+			return None
+		self._send(client_socket, "150 File status ok")
+		# Send file data
+		with open(file_path, "rb") as file:
+			i = 0
+			while True:
+				data = file.read(BUFFER_SIZE)
+				if not data:
+					break
+				self._send(client_socket, data)
+				print(f"Sent chunk {i}: {len(data)} Bytes")
+				i += 1
+			self._send(client_socket, "EOF")  # Mark the end of file, notify client to stop receiving
+
+		self._send(client_socket, "226 Transfer complete")
+		return None
+
+	def _process_client_message(self, client_socket: socket.socket, message: str) -> bool:
+		"""
+		Process a message from client
+
+		:param client_socket: Client socket
+		:param message: Message received
+		:return: Whether client still connecting
+		"""
+		split_message = message.split()
+		match split_message[0].upper():
 			case "LIST":
-				_list(conn, msg)
-			case "GET" | "RETR":
-				_retr(conn, msg)
+				self._list(client_socket)
 			case "QUIT":
-				_quit(conn)
-				break
-			case "SIZE":
-				_size(conn, msg)
+				self._quit(client_socket)
+				return False
+			case "RETR":
+				try:
+					file_name = split_message[1]
+				except IndexError:  # Command missing parameter
+					self._send(client_socket, "501 Syntax error: Expected file name after RETR command")
+				else:
+					self._retr(client_socket, file_name)
 			case _:
-				conn.send(f"501 Unknown command {msg}".encode(FORMAT))
+				self._send(client_socket, f"501 Syntax error: Unknown command {message}")
+		return True
 
-	sock.close()
-	return None
+	def _handle_client(self, client_socket: socket.socket, client_address: tuple[str, int]) -> None:
+		"""
+		Handle client socket
+
+		:param client_socket: Client socket
+		:param client_address: Client address
+		:return: None
+		"""
+		while True:
+			message = self._recv(client_socket)
+			try:
+				if not self._process_client_message(client_socket, message[1]):
+					break
+			except Exception as e:
+				print(f"Exception: {e}")
+				break
+
+		print(f"Client disconnected. IP {client_address[0]} on port {client_address[1]}\n")
+		return None
+
+	def run(self) -> None:
+		self._control_socket.listen()
+		self._control_socket.setblocking(False)
+
+		while True:
+			client_socket, client_address = self._control_socket.accept()
+			client_socket.setblocking(False)
+			self._handle_client(client_socket, client_address)
+			self._control_socket.close()
 
 
 if __name__ == "__main__":
-	main()
+	server = Server(host=SERVER_HOST, port=SERVER_PORT)
+	server.run()
