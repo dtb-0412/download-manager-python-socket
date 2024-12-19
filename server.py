@@ -1,8 +1,9 @@
 import os
 import json
-# import select
+import select
 import socket
 import struct
+import time
 from typing import Optional
 
 from constants import SERVER_HOST, SERVER_PORT, BUFFER_SIZE, ENCODE_FORMAT, DATA_DIRECTORY
@@ -19,6 +20,19 @@ class Server:
 		self._control_socket.bind(self.address)
 
 		self._clients = {}
+		"""
+		dict = {
+			client_socket: {
+				"host": client ip,
+				"port": client port,
+				"message": client message
+				"sockets": [Sockets for download]
+			}
+		}
+		"""
+
+		self._inputs = [self._control_socket]
+		self._outputs = []
 
 		self._permitted_files = {}
 		self._load_file_permissions()
@@ -28,20 +42,31 @@ class Server:
 		return self._host, self._port
 
 	@staticmethod
-	def _send(client_socket: socket.socket, data: str | bytes) -> None:
+	def _send(client_socket: socket.socket, data: str | bytes, retries: int = 5, delay: float = 0.1) -> int:
 		"""
 		Send data to the client socket
 
 		:param client_socket: Socket to send
 		:param data: Data to send, encode to bytes if necessary
-		:return: None
+		:return: Number of bytes sent
 		"""
 		if isinstance(data, str):
 			data = data.encode(ENCODE_FORMAT)
-		
+
 		packed_data = struct.pack("!I", len(data)) + data
-		client_socket.sendall(packed_data)
-		return None
+
+		total_sent = 0
+		while total_sent < len(packed_data):
+			try:
+				current_sent = client_socket.send(packed_data[total_sent:])
+				total_sent += current_sent
+			except socket.error:
+				if retries > 0:
+					retries -= 1
+					time.sleep(delay)
+				else:
+					break
+		return total_sent
 
 	@staticmethod
 	def _recv(client_socket: socket.socket) -> Optional[tuple[int, str]]:
@@ -77,7 +102,7 @@ class Server:
 		return data
 
 	@staticmethod
-	def _get_open_address() -> Optional[tuple[str, int]]:
+	def _get_open_port() -> Optional[int]:
 		"""
 		Get an open port from the operating system
 
@@ -86,7 +111,7 @@ class Server:
 		try:
 			with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
 				sock.bind(("", 0))
-				return sock.getsockname()
+				return sock.getsockname()[1]
 		except OSError:
 			print(f"Service unavailable, please reconnect later")
 		return None
@@ -102,7 +127,11 @@ class Server:
 			if not data:
 				return None
 
-			self._permitted_files = {file_name: os.path.getsize(os.path.join(DATA_DIRECTORY, file_name)) for file_name in set(data.keys())}
+			self._permitted_files.clear()
+			for file_name in set(data.keys()):
+				file_path = os.path.join(DATA_DIRECTORY, file_name)
+				if os.path.exists(file_path):
+					self._permitted_files[file_name] = os.path.getsize(file_path)
 		return None
 
 	def _get_file_status(self, client_socket: socket.socket, file_name: str) -> tuple[bool, Optional[str]]:
@@ -118,11 +147,31 @@ class Server:
 			self._send(client_socket, f"550 File unavailable: {file_name}")
 			return False, None
 		# Check file existence
-		file_path = os.path.join(DATA_DIRECTORY, file_name)
-		if not os.path.exists(file_path):
-			self._send(client_socket, f"550 File missing: {file_name}")
-			return False, None
-		return True, file_path
+		return True, os.path.join(DATA_DIRECTORY, file_name)
+
+	def _handle_chunk(self, client_socket: socket.socket, file_path: str) -> None:
+		msg = self._recv(client_socket)
+		split_msg = msg[1].split()
+		if split_msg[0].upper() == "RETR":
+			try:
+				file_name = split_msg[1]
+				try:
+					offset = int(split_msg[2])
+				except IndexError:
+					offset = 0
+				try:
+					size = int(split_msg[3])
+				except IndexError:
+					size = self._permitted_files[file_name]
+			except IndexError:  # Command missing parameter
+				self._send(client_socket, "501 Syntax error: Expected file name after RETR command")
+			else:
+				self._retr(client_socket, file_path, offset, size)
+
+		self._recv(client_socket)
+		self._send(client_socket, "226 Goodbye!")
+		client_socket.close()
+		return None
 
 	def _list(self, client_socket: socket.socket) -> None:
 		"""
@@ -151,32 +200,76 @@ class Server:
 		client_socket.close()
 		return None
 
-	def _retr(self, client_socket: socket.socket, file_name: str) -> None:
+	def _retr(self, client_socket: socket.socket, file_name: str, offset: int, size: int) -> None:
 		"""
 		Send requested file to client
 
 		:param client_socket: Client socket
 		:param file_name: File name
+		:param offset: Starting byte offset
+		:param size: Number of bytes to download
 		:return: None
 		"""
-		# Check file status
 		file_status, file_path = self._get_file_status(client_socket, file_name)
 		if not file_status:
 			return None
 		self._send(client_socket, "150 File status ok")
 		# Send file data
+		total_sent = 0
 		with open(file_path, "rb") as file:
-			i = 0
+			file.seek(offset)
+			# i = 0
 			while True:
-				data = file.read(BUFFER_SIZE)
+				data = file.read(min(BUFFER_SIZE, size - total_sent))
 				if not data:
 					break
-				self._send(client_socket, data)
-				print(f"Sent chunk {i}: {len(data)} Bytes")
-				i += 1
+
+				current_sent = self._send(client_socket, data) - 4
+				total_sent += current_sent
+				if total_sent >= size:
+					break
+				# print(f"Sent chunk {i} from offset {offset}: {len(data)} Bytes")
+				# i += 1
 			self._send(client_socket, "EOF")  # Mark the end of file, notify client to stop receiving
+		print(f"Sent {total_sent} / {size} = {total_sent / size * 100} %")
 
 		self._send(client_socket, "226 Transfer complete")
+		return None
+
+	def _accept_client(self) -> None:
+		"""
+		Accept incoming client connection, initialize client session
+
+		:return: None
+		"""
+		client_socket, (client_host, client_port) = self._control_socket.accept()
+		client_socket.setblocking(False)
+
+		client_data = {
+			"host": client_host,
+			"port": client_port,
+			"message": None
+		}
+		self._clients[client_socket] = client_data
+		self._inputs.append(client_socket)
+		print(f"Client connected: IP {client_host} on port {client_port}\n")
+		return None
+
+	def _remove_client(self, client_socket: socket.socket) -> None:
+		"""
+		Remove client record on server
+
+		:param client_socket: Client socket
+		:return: None
+		"""
+		print(f"Client disconnected. IP {self._clients[client_socket]['host']} on port {self._clients[client_socket]['port']}\n")
+
+		self._clients.pop(client_socket)
+		for record in (self._inputs, self._outputs):
+			try:
+				record.remove(client_socket)
+			except ValueError:
+				pass
 		return None
 
 	def _process_client_message(self, client_socket: socket.socket, message: str) -> bool:
@@ -187,53 +280,59 @@ class Server:
 		:param message: Message received
 		:return: Whether client still connecting
 		"""
-		split_message = message.split()
-		match split_message[0].upper():
+		split_msg = message.split()
+		match split_msg[0].upper():
 			case "LIST":
 				self._list(client_socket)
 			case "QUIT":
 				self._quit(client_socket)
-				return False
+				self._remove_client(client_socket)
+				return True
 			case "RETR":
 				try:
-					file_name = split_message[1]
+					file_name = split_msg[1]
+					try:
+						offset = int(split_msg[2])
+					except IndexError:
+						offset = 0
+					try:
+						size = int(split_msg[3])
+					except IndexError:
+						size = self._permitted_files[file_name]
 				except IndexError:  # Command missing parameter
 					self._send(client_socket, "501 Syntax error: Expected file name after RETR command")
 				else:
-					self._retr(client_socket, file_name)
+					self._retr(client_socket, file_name, offset, size)
 			case _:
 				self._send(client_socket, f"501 Syntax error: Unknown command {message}")
+
+		self._clients[client_socket]["message"] = None
+		self._outputs.remove(client_socket)
 		return True
-
-	def _handle_client(self, client_socket: socket.socket, client_address: tuple[str, int]) -> None:
-		"""
-		Handle client socket
-
-		:param client_socket: Client socket
-		:param client_address: Client address
-		:return: None
-		"""
-		while True:
-			message = self._recv(client_socket)
-			try:
-				if not self._process_client_message(client_socket, message[1]):
-					break
-			except Exception as e:
-				print(f"Exception: {e}")
-				break
-
-		print(f"Client disconnected. IP {client_address[0]} on port {client_address[1]}\n")
-		return None
 
 	def run(self) -> None:
 		self._control_socket.listen()
 		self._control_socket.setblocking(False)
+		print(f"Server listening: IP {self._host} on port {self._port}")
 
-		while True:
-			client_socket, client_address = self._control_socket.accept()
-			client_socket.setblocking(False)
-			self._handle_client(client_socket, client_address)
-			self._control_socket.close()
+		while self._inputs:
+			readable, writable, exceptional = select.select(self._inputs, self._outputs, self._inputs)
+
+			for sock in readable:
+				if sock is self._control_socket:
+					self._accept_client()
+				else:
+					message = self._recv(sock)
+					self._clients[sock]["message"] = message[1]
+					self._outputs.append(sock)
+
+			for sock in writable:
+				if (message := self._clients[sock]["message"]) is not None:
+					self._process_client_message(sock, message)
+
+			for sock in exceptional:
+				self._remove_client(sock)
+		return None
 
 
 if __name__ == "__main__":
