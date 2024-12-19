@@ -131,13 +131,22 @@ class Client:
 		print("--------------------------------------------------")
 		return None
 
-	def _handle_chunk(self, client_socket: socket.socket, file_name: str, offset: int, chunk_size: int, chunk_order: int, file_data: list) -> None:
+	@staticmethod
+	def display_progress(progress):
+		print("\rDownload Progress: ", end="")
+		for part in range(4):
+			print(f"Part {part + 1}: {progress[part]:.2f}% | ", end="")
+		print("", end="", flush=True)
+		return None
+
+	def _handle_chunk(self, client_socket: socket.socket, file_name: str, offset: int, chunk_size: int, chunk_order: int, file_data: list,
+					  progresses: list) -> None:
 		self._send(client_socket, f"RETR {file_name} {offset} {chunk_size}")  # Request file from server
 		self._recv(client_socket)  # Guaranteed file available
 		# Receive file data to buffer
 		total_received = 0
 		file_buffer = bytearray()
-		print(f"Begin download chunk {chunk_order}:")
+		# print(f"Begin download chunk {chunk_order}:")
 		while True:
 			current_received, data = self._recv_raw(client_socket)
 			if data == "EOF".encode(ENCODE_FORMAT):
@@ -145,9 +154,10 @@ class Client:
 				break
 			file_buffer.extend(data)
 			total_received += current_received
-			progress = int(total_received / chunk_size * 100)
+			progresses[chunk_order] = int(total_received / chunk_size * 100)
+			self.display_progress(progresses)
 
-		print(f"Finish download chunk {chunk_order}: {total_received} / {chunk_size} Bytes, {total_received / chunk_size * 100} %")
+		# print(f"Finish download chunk {chunk_order}: {total_received} / {chunk_size} Bytes, {total_received / chunk_size * 100} %")
 		file_data[chunk_order] = file_buffer
 		self._recv(client_socket)
 		self._disconnect(client_socket)
@@ -169,12 +179,13 @@ class Client:
 		chunk_sizes = [whole + first_3_chunks] * 3 + [whole + last_chunk]
 
 		threads = []
+		progresses = [0] * 4
 		for chunk_order, chunk_size in enumerate(chunk_sizes):
 			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 			sock.connect((SERVER_HOST, SERVER_PORT))
 
 			offset = sum(chunk_sizes[:chunk_order])
-			thread = threading.Thread(target=self._handle_chunk, args=(sock, file_name, offset, chunk_size, chunk_order, file_data))
+			thread = threading.Thread(target=self._handle_chunk, args=(sock, file_name, offset, chunk_size, chunk_order, file_data, progresses))
 			threads.append(thread)
 			thread.start()
 
