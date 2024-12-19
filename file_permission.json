@@ -1,0 +1,8 @@
+{
+    "permitted_files": {
+        "sample_video_35MB.mp4":  "35MB",
+        "sample_video_87MB.mp4":  "87MB",
+        "sample_video_141MB.mp4": "141MB",
+        "sample_video_500MB.mp4": "500MB"
+    }
+}
